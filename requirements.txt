@@ -1,5 +1,10 @@
 torch
+torchvision
+apex
 numpy
 tqdm
 tensorboard
 ml-collections
+pyramid==1.5
+scipy
+ipykernel

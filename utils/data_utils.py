@@ -34,7 +34,7 @@ def get_loader(args):
                                    download=True,
                                    transform=transform_test) if args.local_rank in [-1, 0] else None
 
-    else:
+    elif args.dataset == "cifar100":
         trainset = datasets.CIFAR100(root="./data",
                                      train=True,
                                      download=True,
@@ -43,6 +43,16 @@ def get_loader(args):
                                     train=False,
                                     download=True,
                                     transform=transform_test) if args.local_rank in [-1, 0] else None
+    
+    elif args.dataset == "hymenoptera":
+        trainset = datasets.ImageFolder(root="./data/hymenoptera/train",
+                                        transform=transform_train)
+        testset = datasets.ImageFolder(root="./data/hymenoptera/val",
+                                       transform=transform_test) if args.local_rank in [-1, 0] else None    
+    
+    else:
+        raise ValueError("Invalid dataset name")
+    
     if args.local_rank == 0:
         torch.distributed.barrier()
 

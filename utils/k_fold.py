@@ -14,16 +14,18 @@ class KFoldDataset(torch.utils.data.Dataset):
         super().__init__()
         self.args = args
         self.n_splits = args.k_fold
-        self.splitter = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=args.seed)
+        self.splitter = StratifiedKFold(
+            n_splits=self.n_splits, shuffle=True, random_state=args.seed
+        )
         self.folds = []
-    
+
     def split(self, dataset):
         self.folds = []
 
         # prepare inputs
         labels = np.array(dataset.targets)
         fake_inputs = np.zeros(len(labels))
-        
+
         fold_iterator = self.splitter.split(fake_inputs, labels)
         for train_idx, val_idx in fold_iterator:
             # create subset
@@ -55,10 +57,12 @@ class KFoldEnsembleModel(nn.Module):
     def load_model(self, model_path: str):
         config = CONFIGS[self.args.model_type]
         num_classes = NUM_CLASS_MAPPING[self.args.dataset]
-        model = VisionTransformer(config, self.args.img_size, zero_head=True, num_classes=num_classes)
+        model = VisionTransformer(
+            config, self.args.img_size, zero_head=True, num_classes=num_classes
+        )
         model.load_from(np.load(model_path))
         return model
-    
+
     def forward(self, x):
         logits = [model(x)[0] for model in self.models]
         if self.decide_mode == "mean":
@@ -67,4 +71,3 @@ class KFoldEnsembleModel(nn.Module):
             return torch.stack(logits).max(dim=0)
         else:
             raise ValueError("Invalid decide mode!")
-

@@ -148,5 +148,4 @@ cython_debug/
 # My ignore
 logs/
 output/
-data/
 checkpoint/

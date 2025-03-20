@@ -1,18 +1,19 @@
 import logging
 
-import torch
-
 from torchvision import transforms, datasets
-from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
-
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 logger = logging.getLogger(__name__)
 
 
-def get_loader(args):
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()
+NUM_CLASS_MAPPING = {
+    "cifar10": 10,
+    "cifar100": 100,
+    "hymenoptera": 2
+}
 
+
+def get_datasets(args):
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop((args.img_size, args.img_size), scale=(0.05, 1.0)),
         transforms.ToTensor(),
@@ -53,20 +54,20 @@ def get_loader(args):
     else:
         raise ValueError("Invalid dataset name")
     
-    if args.local_rank == 0:
-        torch.distributed.barrier()
+    return trainset, testset
 
-    train_sampler = RandomSampler(trainset) if args.local_rank == -1 else DistributedSampler(trainset)
-    test_sampler = SequentialSampler(testset)
-    train_loader = DataLoader(trainset,
-                              sampler=train_sampler,
-                              batch_size=args.train_batch_size,
-                              num_workers=4,
-                              pin_memory=True)
-    test_loader = DataLoader(testset,
-                             sampler=test_sampler,
-                             batch_size=args.eval_batch_size,
-                             num_workers=4,
-                             pin_memory=True) if testset is not None else None
 
-    return train_loader, test_loader
+def get_loader(dataset, args, eval=False):
+    # prepare sampler
+    if not eval:
+        sampler = RandomSampler(dataset)
+    else:
+        sampler = SequentialSampler(dataset)
+    
+    # prepare dataloader
+    loader = DataLoader(dataset,
+                        sampler=sampler,
+                        batch_size=args.train_batch_size if not eval else args.eval_batch_size,
+                        num_workers=4,
+                        pin_memory=True)
+    return loader

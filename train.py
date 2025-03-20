@@ -19,8 +19,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from models.modeling import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
-from utils.data_utils import get_loader
-from utils.dist_util import get_world_size
+from utils.data_utils import get_datasets, get_loader, NUM_CLASS_MAPPING
+from utils.k_fold import KFoldDataset, KFoldEnsembleModel
 
 
 logger = logging.getLogger(__name__)
@@ -48,22 +48,17 @@ def simple_accuracy(preds, labels):
     return (preds == labels).mean()
 
 
-def save_model(args, model):
+def save_model(args, model, fold=0):
     model_to_save = model.module if hasattr(model, 'module') else model
-    model_checkpoint = os.path.join(args.output_dir, "%s_checkpoint.bin" % args.name)
+    model_checkpoint = os.path.join(args.output_dir, f"{args.name}_fold{fold}_checkpoint.bin")
     torch.save(model_to_save.state_dict(), model_checkpoint)
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
+    return model_checkpoint
 
 
 def setup(args):
     # Prepare model
     config = CONFIGS[args.model_type]
-    
-    NUM_CLASS_MAPPING = {
-        "cifar10": 10,
-        "cifar100": 100,
-        "hymenoptera": 2
-    }
     num_classes = NUM_CLASS_MAPPING[args.dataset]
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
@@ -91,18 +86,18 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def valid(args, model, writer, test_loader, global_step):
+def valid(args, model, writer, test_loader, global_step, is_test=False):
     # Validation!
     eval_losses = AverageMeter()
 
-    logger.info("***** Running Validation *****")
+    logger.info("***** Running {} *****".format("Validation" if not is_test else "Testing"))
     logger.info("  Num steps = %d", len(test_loader))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
     model.eval()
     all_preds, all_label = [], []
     epoch_iterator = tqdm(test_loader,
-                          desc="Validating... (loss=X.X)",
+                          desc="{}... (loss=X.X)".format("Validating" if not is_test else "Testing"),
                           bar_format="{l_bar}{r_bar}",
                           dynamic_ncols=True,
                           disable=args.local_rank not in [-1, 0])
@@ -132,15 +127,22 @@ def valid(args, model, writer, test_loader, global_step):
 
     all_preds, all_label = all_preds[0], all_label[0]
     accuracy = simple_accuracy(all_preds, all_label)
+    avg_loss = eval_losses.avg
 
     logger.info("\n")
-    logger.info("Validation Results")
+    logger.info("{} Results".format("Test" if is_test else "Validation"))
     logger.info("Global Steps: %d" % global_step)
-    logger.info("Valid Loss: %2.5f" % eval_losses.avg)
-    logger.info("Valid Accuracy: %2.5f" % accuracy)
-
-    writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
-    return accuracy
+    if is_test:
+        logger.info("Test Loss: %2.5f" % avg_loss)
+        logger.info("Test Accuracy: %2.5f" % accuracy)
+        writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
+        writer.add_scalar("test/loss", scalar_value=avg_loss, global_step=global_step)
+    else:
+        logger.info("Valid Loss: %2.5f" % avg_loss)
+        logger.info("Valid Accuracy: %2.5f" % accuracy)
+        writer.add_scalar("val/accuracy", scalar_value=accuracy, global_step=global_step)
+        writer.add_scalar("val/loss", scalar_value=avg_loss, global_step=global_step)
+    return accuracy, avg_loss
 
 
 def train(args, model):
@@ -152,7 +154,10 @@ def train(args, model):
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
-    train_loader, test_loader = get_loader(args)
+    trainset, testset = get_datasets(args)
+    if args.k_fold > 1:
+        trainset = KFoldDataset(args).split(trainset)
+    test_loader = get_loader(testset, args, eval=True)
 
     # Prepare optimizer and scheduler
     optimizer = torch.optim.SGD(model.parameters(),
@@ -165,15 +170,15 @@ def train(args, model):
     else:
         scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-    if args.fp16:
-        model, optimizer = amp.initialize(models=model,
-                                          optimizers=optimizer,
-                                          opt_level=args.fp16_opt_level)
-        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+    # if args.fp16:
+    #     model, optimizer = amp.initialize(models=model,
+    #                                       optimizers=optimizer,
+    #                                       opt_level=args.fp16_opt_level)
+    #     amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
-    # Distributed training
-    if args.local_rank != -1:
-        model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+    # # Distributed training
+    # if args.local_rank != -1:
+    #     model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
 
     # Train!
     logger.info("***** Running training *****")
@@ -187,61 +192,106 @@ def train(args, model):
     model.zero_grad()
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
     losses = AverageMeter()
-    global_step, best_acc = 0, 0
-    while True:
-        model.train()
-        epoch_iterator = tqdm(train_loader,
-                              desc="Training (X / X Steps) (loss=X.X)",
-                              bar_format="{l_bar}{r_bar}",
-                              dynamic_ncols=True,
-                              disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            batch = tuple(t.to(args.device) for t in batch)
-            x, y = batch
-            loss = model(x, y)
 
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+    fold_accs, fold_losses, fold_paths = [], [], []
+    for fold in range(args.k_fold):
+        logger.info(f"Training fold: {fold + 1} / {args.k_fold}")
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                losses.update(loss.item()*args.gradient_accumulation_steps)
+        # prepare dataset
+        if args.k_fold > 1:
+            train_loader, val_loader = trainset.get_fold(fold)
+        else:
+            train_loader = get_loader(trainset, args)
+            val_loader = test_loader
+    
+        global_step = 0
+        best_acc, best_loss = 0, float('inf')
+        best_path = None
+
+        while True:
+            model.train()
+            epoch_iterator = tqdm(
+                train_loader,
+                desc="Training (X / X Steps) (loss=X.X)",
+                bar_format="{l_bar}{r_bar}",
+                dynamic_ncols=True,
+                disable=args.local_rank not in [-1, 0])
+            for step, batch in enumerate(epoch_iterator):
+                batch = tuple(t.to(args.device) for t in batch)
+                x, y = batch
+                loss = model(x, y)
+
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
                 if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    # with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    #     scaled_loss.backward()
+                    pass
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scheduler.step()
-                optimizer.step()
-                optimizer.zero_grad()
-                global_step += 1
+                    loss.backward()
 
-                epoch_iterator.set_description(
-                    "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, losses.val)
-                )
-                if args.local_rank in [-1, 0]:
-                    writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
-                    writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
-                if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                    accuracy = valid(args, model, writer, test_loader, global_step)
-                    if best_acc < accuracy:
-                        save_model(args, model)
-                        best_acc = accuracy
-                    model.train()
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    losses.update(loss.item()*args.gradient_accumulation_steps)
+                    if args.fp16:
+                        # torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                        pass
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    global_step += 1
 
-                if global_step % t_total == 0:
-                    break
-        losses.reset()
-        if global_step % t_total == 0:
-            break
+                    epoch_iterator.set_description(
+                        "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, losses.val)
+                    )
+                    if args.local_rank in [-1, 0]:
+                        writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
+                        writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                    if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
+                        val_acc, val_loss = valid(args, model, writer, val_loader, global_step)
+                        if best_loss > val_loss:
+                            best_path = save_model(args, model, fold)
+                            logger.info("Best model saved at %s" % best_path)
+                            
+                            logger.info("Update best loss from %f to %f" % (best_loss, val_loss))
+                            logger.info("Update best accuracy from %f to %f" % (best_acc, val_acc))
+                            best_loss = val_loss
+                            best_acc = val_acc
+                        model.train()
 
-    if args.local_rank in [-1, 0]:
-        writer.close()
-    logger.info("Best Accuracy: \t%f" % best_acc)
-    logger.info("End Training!")
+                    if global_step % t_total == 0:
+                        break
+
+            losses.reset()
+            if global_step % t_total == 0:
+                break
+
+        if args.local_rank in [-1, 0]:
+            writer.close()
+        logger.info("Best Accuracy: \t%f" % best_acc)
+        logger.info("Best Loss: \t%f" % best_loss)
+        logger.info("Done training fold %d" % (fold + 1))
+        logger.info("===================================")
+
+        # save fold results
+        fold_accs.append(best_acc)
+        fold_losses.append(best_loss)
+        fold_paths.append(best_path)
+    
+    logger.info("All folds done!")
+    logger.info("Average Accuracy: \t%f" % np.mean(fold_accs))
+    logger.info("Average Loss: \t%f" % np.mean(fold_losses))
+    logger.info("All Paths: %s" % fold_paths)
+    logger.info("===================================")
+    
+    # test the best model
+    if args.do_test:
+        if args.k_fold > 1:
+            model.load_state_dict(torch.load(best_path))
+        else:
+            model = KFoldEnsembleModel(fold_paths, args, decide_mode="mean")
+        valid(args, model, writer, test_loader, global_step, is_test=True)
 
 
 def main():
@@ -298,6 +348,11 @@ def main():
                         help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
+
+    # custom args
+    parser.add_argument("--k-fold", type=int, default=1, help="Number of folds for cross-validation")
+    parser.add_argument("--do-test", action="store_true", help="Whether to test the model after training")
+
     args = parser.parse_args()
 
     # Setup CUDA, GPU & distributed training

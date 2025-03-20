@@ -155,7 +155,7 @@ def valid(args, model, writer, test_loader, global_step, is_test=False):
     return accuracy, avg_loss
 
 
-def train(args, model):
+def train(args):
     """Train the model"""
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -169,33 +169,6 @@ def train(args, model):
         trainset = KFoldDataset(args).split(trainset)
     test_loader = get_loader(testset, args, eval=True)
 
-    # Prepare optimizer and scheduler
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=args.learning_rate,
-        momentum=0.9,
-        weight_decay=args.weight_decay,
-    )
-    t_total = args.num_steps
-    if args.decay_type == "cosine":
-        scheduler = WarmupCosineSchedule(
-            optimizer, warmup_steps=args.warmup_steps, t_total=t_total
-        )
-    else:
-        scheduler = WarmupLinearSchedule(
-            optimizer, warmup_steps=args.warmup_steps, t_total=t_total
-        )
-
-    # if args.fp16:
-    #     model, optimizer = amp.initialize(models=model,
-    #                                       optimizers=optimizer,
-    #                                       opt_level=args.fp16_opt_level)
-    #     amp._amp_state.loss_scalers[0]._loss_scale = 2**20
-
-    # # Distributed training
-    # if args.local_rank != -1:
-    #     model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
-
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Total optimization steps = %d", args.num_steps)
@@ -208,13 +181,41 @@ def train(args, model):
     )
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
 
-    model.zero_grad()
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
     losses = AverageMeter()
 
     fold_accs, fold_losses, fold_paths = [], [], []
     for fold in range(args.k_fold):
         logger.info(f"Training fold: {fold + 1} / {args.k_fold}")
+
+        # Model & Tokenizer Setup
+        args, model = setup(args)
+
+        # Freeze all layers except the head
+        print(model)
+        for name, module in model.named_parameters():
+            if name.startswith("head"):
+                module.requires_grad = True
+            else:
+                module.requires_grad = False
+
+        # Prepare optimizer and scheduler
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=args.learning_rate,
+            momentum=0.9,
+            weight_decay=args.weight_decay,
+        )
+        t_total = args.num_steps
+        if args.decay_type == "cosine":
+            scheduler = WarmupCosineSchedule(
+                optimizer, warmup_steps=args.warmup_steps, t_total=t_total
+            )
+        else:
+            scheduler = WarmupLinearSchedule(
+                optimizer, warmup_steps=args.warmup_steps, t_total=t_total
+            )
+        model.zero_grad()
 
         # prepare dataset
         if args.k_fold > 1:
@@ -503,19 +504,8 @@ def main():
     # Set seed
     set_seed(args)
 
-    # Model & Tokenizer Setup
-    args, model = setup(args)
-
-    # Freeze all layers except the head
-    print(model)
-    for name, module in model.named_parameters():
-        if name.startswith("head"):
-            module.requires_grad = True
-        else:
-            module.requires_grad = False
-
     # Training
-    train(args, model)
+    train(args)
 
 
 if __name__ == "__main__":
